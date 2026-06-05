@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2021",
+    "lib": ["ES2021"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "allowSyntheticDefaultImports": true,
+    "moduleResolution": "node",
+    "baseUrl": "./src",
+    "paths": {
+      "@/*": ["."],
+      "@config/*": ["config/*"],
+      "@modules/*": ["modules/*"],
+      "@common/*": ["common/*"],
+      "@database/*": ["database/*"],
+      "@guards/*": ["common/guards/*"],
+      "@decorators/*": ["common/decorators/*"],
+      "@filters/*": ["common/filters/*"],
+      "@middlewares/*": ["common/middlewares/*"],
+      "@pipes/*": ["common/pipes/*"],
+      "@interceptors/*": ["common/interceptors/*"],
+      "@services/*": ["services/*"],
+      "@utils/*": ["common/utils/*"],
+      "@types/*": ["common/types/*"],
+      "@constants/*": ["common/constants/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test", "**/*spec.ts"]
+}
