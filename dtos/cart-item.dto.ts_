@@ -1,0 +1,54 @@
+import { IsMongoId, IsNumber, IsEnum, Min } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+
+export class AddToCartDto {
+  @ApiProperty({ example: '507f1f77bcf86cd799439011' })
+  @IsMongoId()
+  productId: string;
+
+  @ApiProperty({ example: '507f1f77bcf86cd799439012' })
+  @IsMongoId()
+  packageId: string; // Package ID within product
+
+  @ApiProperty({ example: 2 })
+  @IsNumber()
+  @Min(1)
+  @Type(() => Number)
+  quantity: number;
+}
+
+export class UpdateCartItemDto {
+  @ApiProperty({ example: 5 })
+  @IsNumber()
+  @Min(1)
+  @Type(() => Number)
+  quantity: number;
+}
+
+export class UpdateCartItemQuantityDto {
+  @ApiProperty({ example: 'increase' })
+  @IsEnum(['increase', 'decrease', 'set'])
+  action: 'increase' | 'decrease' | 'set';
+
+  @ApiProperty({ example: 1 })
+  @IsNumber()
+  @Min(0)
+  @Type(() => Number)
+  quantity: number;
+}
+
+export class CartItemResponseDto {
+  productId: string;
+  packageId: string;
+  size: string;
+  unit: string;
+  quantity: number;
+  price: number;
+  discountPrice: number;
+  discountPercentage: number;
+  totalPrice: number;
+  totalDiscountPrice: number;
+  status: string;
+  addedAt: Date;
+}
