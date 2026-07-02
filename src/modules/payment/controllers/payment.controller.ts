@@ -82,7 +82,7 @@ export class PaymentController {
     return this.paymentService.getUserPayments(user.id, queryDto);
   }
 
-  // Webhook endpoint
+  // Webhook endpoint - No database operations, just event handling
   @Post('webhook/stripe')
   @Public()
   @HttpCode(HttpStatus.OK)
