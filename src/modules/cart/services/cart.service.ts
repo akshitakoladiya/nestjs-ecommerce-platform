@@ -1,0 +1,447 @@
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+  Logger,
+  ConflictException,
+} from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { Cart, CartDocument } from '../schemas/cart.schema';
+import { CartItem, CartItemDocument } from '../schemas/cart-item.schema';
+import { AddToCartDto, UpdateCartItemDto, UpdateCartItemQuantityDto } from '../dtos';
+import { ProductService } from '../../product/services/product.service';
+
+@Injectable()
+export class CartService {
+  private logger = new Logger('CartService');
+
+  constructor(
+    @InjectModel(Cart.name) private cartModel: Model<CartDocument>,
+    @InjectModel(CartItem.name) private cartItemModel: Model<CartItemDocument>,
+    private productService: ProductService,
+  ) {}
+
+  // Get or create cart for user
+  async getOrCreateCart(userId: string): Promise<CartDocument> {
+    let cart = await this.cartModel.findOne({ userId, isActive: true });
+
+    if (!cart) {
+      cart = await this.cartModel.create({
+        userId,
+        items: [],
+        totalItems: 0,
+        totalQuantity: 0,
+        subtotal: 0,
+        totalDiscount: 0,
+        totalPrice: 0,
+        status: 'active',
+      });
+    }
+
+    return cart;
+  }
+
+  // Get cart by user ID
+  async getCart(userId: string): Promise<CartDocument> {
+    const cart = await this.cartModel.findOne({ userId, isActive: true }).populate('items');
+
+    if (!cart) {
+      throw new NotFoundException('Cart not found');
+    }
+
+    return cart;
+  }
+
+  // Add item to cart
+  async addToCart(userId: string, addToCartDto: AddToCartDto): Promise<CartDocument> {
+    const { productId, packageId, quantity } = addToCartDto;
+
+    // Get product and validate package
+    const product = await this.productService.findById(productId);
+    const packageData = product.packages.find(p => p._id.toString() === packageId);
+
+    if (!packageData) {
+      throw new NotFoundException('Package not found for this product');
+    }
+
+    if (!packageData.isActive || !packageData.isAvailableForSale) {
+      throw new BadRequestException('This package is not available for sale');
+    }
+
+    // Check stock availability
+    const availableStock = packageData.stock - packageData.reservedQuantity;
+    if (availableStock < quantity) {
+      throw new BadRequestException(
+        `Insufficient stock. Available: ${availableStock}`,
+      );
+    }
+
+    // Get or create cart
+    const cart = await this.getOrCreateCart(userId);
+
+    // Check if item already exists in cart
+    const existingItem = cart.items.find(
+      item =>
+        item.productId.toString() === productId &&
+        item.packageId.toString() === packageId,
+    );
+
+    const discountPrice = packageData.discountPrice || packageData.price;
+    const discountPercentage = packageData.discountPercentage || 0;
+    const totalPrice = quantity * packageData.price;
+    const totalDiscountPrice = quantity * discountPrice;
+
+    if (existingItem) {
+      // Update existing item quantity
+      const newQuantity = (existingItem as any).quantity + quantity;
+
+      // Validate new quantity against stock
+      if (availableStock < newQuantity) {
+        throw new BadRequestException(
+          `Insufficient stock. Available: ${availableStock}`,
+        );
+      }
+
+      (existingItem as any).quantity = newQuantity;
+      (existingItem as any).totalPrice = newQuantity * packageData.price;
+      (existingItem as any).totalDiscountPrice = newQuantity * discountPrice;
+      (existingItem as any).updatedAt = new Date();
+    } else {
+      // Add new item to cart
+      cart.items.push({
+        productId,
+        packageId,
+        size: packageData.size,
+        unit: packageData.unit,
+        quantity,
+        price: packageData.price,
+        discountPrice,
+        discountPercentage,
+        totalPrice,
+        totalDiscountPrice,
+        status: 'pending',
+        reservationExpires: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        addedAt: new Date(),
+      } as any);
+    }
+
+    // Recalculate cart totals
+    await this.recalculateCart(cart);
+
+    // Reserve stock
+    await this.productService.adjustPackageStock(productId, packageId, {
+      action: 'reserve',
+      quantity,
+      reason: 'Added to cart',
+      referenceId: `CART-${userId}`,
+    });
+
+    return cart;
+  }
+
+  // Update cart item quantity
+  async updateCartItem(
+    userId: string,
+    cartItemId: string,
+    updateCartItemDto: UpdateCartItemDto,
+  ): Promise<CartDocument> {
+    const { quantity } = updateCartItemDto;
+
+    const cart = await this.getCart(userId);
+
+    const cartItem = cart.items.find(item => item._id.toString() === cartItemId);
+    if (!cartItem) {
+      throw new NotFoundException('Cart item not found');
+    }
+
+    // Get product to check stock
+    const product = await this.productService.findById(
+      cartItem.productId.toString(),
+    );
+    const packageData = product.packages.find(
+      p => p._id.toString() === cartItem.packageId.toString(),
+    );
+
+    if (!packageData) {
+      throw new NotFoundException('Package not found');
+    }
+
+    const availableStock = packageData.stock - packageData.reservedQuantity;
+    if (availableStock < quantity) {
+      throw new BadRequestException(
+        `Insufficient stock. Available: ${availableStock}`,
+      );
+    }
+
+    // Release old reservation and reserve new quantity
+    const oldQuantity = (cartItem as any).quantity;
+    const quantityDifference = quantity - oldQuantity;
+
+    if (quantityDifference > 0) {
+      // Need more stock
+      await this.productService.adjustPackageStock(
+        cartItem.productId.toString(),
+        cartItem.packageId.toString(),
+        {
+          action: 'reserve',
+          quantity: quantityDifference,
+          reason: 'Updated cart item quantity',
+          referenceId: `CART-${userId}`,
+        },
+      );
+    } else if (quantityDifference < 0) {
+      // Release extra reserved stock
+      await this.productService.adjustPackageStock(
+        cartItem.productId.toString(),
+        cartItem.packageId.toString(),
+        {
+          action: 'release',
+          quantity: Math.abs(quantityDifference),
+          reason: 'Reduced cart item quantity',
+          referenceId: `CART-${userId}`,
+        },
+      );
+    }
+
+    (cartItem as any).quantity = quantity;
+    (cartItem as any).totalPrice = quantity * cartItem.price;
+    (cartItem as any).totalDiscountPrice = quantity * cartItem.discountPrice;
+    (cartItem as any).updatedAt = new Date();
+
+    await this.recalculateCart(cart);
+
+    return cart;
+  }
+
+  // Update cart item quantity with action
+  async updateItemQuantityWithAction(
+    userId: string,
+    cartItemId: string,
+    updateDto: UpdateCartItemQuantityDto,
+  ): Promise<CartDocument> {
+    const { action, quantity } = updateDto;
+
+    const cart = await this.getCart(userId);
+    const cartItem = cart.items.find(item => item._id.toString() === cartItemId);
+
+    if (!cartItem) {
+      throw new NotFoundException('Cart item not found');
+    }
+
+    let newQuantity: number;
+
+    switch (action) {
+      case 'increase':
+        newQuantity = (cartItem as any).quantity + quantity;
+        break;
+      case 'decrease':
+        newQuantity = (cartItem as any).quantity - quantity;
+        if (newQuantity < 1) {
+          // Remove item if quantity becomes 0
+          return this.removeFromCart(userId, cartItemId);
+        }
+        break;
+      case 'set':
+        newQuantity = quantity;
+        break;
+      default:
+        throw new BadRequestException('Invalid action');
+    }
+
+    return this.updateCartItem(userId, cartItemId, { quantity: newQuantity });
+  }
+
+  // Remove item from cart
+  async removeFromCart(userId: string, cartItemId: string): Promise<CartDocument> {
+    const cart = await this.getCart(userId);
+
+    const cartItem = cart.items.find(item => item._id.toString() === cartItemId);
+    if (!cartItem) {
+      throw new NotFoundException('Cart item not found');
+    }
+
+    // Release reserved stock
+    await this.productService.adjustPackageStock(
+      cartItem.productId.toString(),
+      cartItem.packageId.toString(),
+      {
+        action: 'release',
+        quantity: (cartItem as any).quantity,
+        reason: 'Removed from cart',
+        referenceId: `CART-${userId}`,
+      },
+    );
+
+    // Remove item from cart
+    cart.items = cart.items.filter(item => item._id.toString() !== cartItemId);
+
+    await this.recalculateCart(cart);
+
+    return cart;
+  }
+
+  // Clear entire cart
+  async clearCart(userId: string): Promise<{ message: string }> {
+    const cart = await this.getCart(userId);
+
+    // Release all reserved stock
+    for (const item of cart.items) {
+      await this.productService.adjustPackageStock(
+        item.productId.toString(),
+        item.packageId.toString(),
+        {
+          action: 'release',
+          quantity: (item as any).quantity,
+          reason: 'Cart cleared',
+          referenceId: `CART-${userId}`,
+        },
+      );
+    }
+
+    cart.items = [];
+    await this.recalculateCart(cart);
+
+    return { message: 'Cart cleared successfully' };
+  }
+
+  // Get cart summary
+  async getCartSummary(userId: string): Promise<any> {
+    const cart = await this.getCart(userId);
+
+    const summary = {
+      totalItems: cart.totalItems,
+      totalQuantity: cart.totalQuantity,
+      subtotal: cart.subtotal,
+      totalDiscount: cart.totalDiscount,
+      totalPrice: cart.totalPrice,
+      items: cart.items.map(item => ({
+        productId: item.productId,
+        packageId: item.packageId,
+        size: item.size,
+        quantity: (item as any).quantity,
+        price: item.price,
+        discountPrice: item.discountPrice,
+        totalPrice: (item as any).totalPrice,
+        totalDiscountPrice: (item as any).totalDiscountPrice,
+      })),
+    };
+
+    return summary;
+  }
+
+  // Validate cart (check stock availability)
+  async validateCart(userId: string): Promise<any> {
+    const cart = await this.getCart(userId);
+
+    const validationResult = {
+      isValid: true,
+      issues: [],
+    };
+
+    for (const item of cart.items) {
+      const product = await this.productService.findById(
+        item.productId.toString(),
+      );
+      const packageData = product.packages.find(
+        p => p._id.toString() === item.packageId.toString(),
+      );
+
+      if (!packageData || !packageData.isActive || !packageData.isAvailableForSale) {
+        validationResult.isValid = false;
+        validationResult.issues.push({
+          itemId: item._id,
+          productId: item.productId,
+          issue: 'Product or package no longer available',
+        });
+      }
+
+      const availableStock = packageData.stock - packageData.reservedQuantity;
+      if (availableStock < (item as any).quantity) {
+        validationResult.isValid = false;
+        validationResult.issues.push({
+          itemId: item._id,
+          productId: item.productId,
+          issue: `Insufficient stock. Available: ${availableStock}`,
+          available: availableStock,
+          required: (item as any).quantity,
+        });
+      }
+    }
+
+    return validationResult;
+  }
+
+  // Convert cart to order (release reservations after order placed)
+  async convertToOrder(userId: string): Promise<CartDocument> {
+    const cart = await this.getCart(userId);
+
+    // Release reservations (will be converted to actual sale)
+    for (const item of cart.items) {
+      await this.productService.adjustPackageStock(
+        item.productId.toString(),
+        item.packageId.toString(),
+        {
+          action: 'release',
+          quantity: (item as any).quantity,
+          reason: 'Order placed',
+          referenceId: `ORDER-${userId}`,
+        },
+      );
+    }
+
+    cart.status = 'converted';
+    cart.convertedAt = new Date();
+    await cart.save();
+
+    return cart;
+  }
+
+  // Mark cart as abandoned
+  async markAsAbandoned(userId: string): Promise<CartDocument> {
+    const cart = await this.getCart(userId);
+
+    cart.status = 'abandoned';
+    cart.abandonedAt = new Date();
+    await cart.save();
+
+    return cart;
+  }
+
+  // Recalculate cart totals
+  private async recalculateCart(cart: CartDocument): Promise<void> {
+    let totalItems = 0;
+    let totalQuantity = 0;
+    let subtotal = 0;
+    let totalDiscount = 0;
+
+    for (const item of cart.items) {
+      totalItems += 1;
+      totalQuantity += (item as any).quantity;
+      subtotal += (item as any).totalPrice;
+      totalDiscount += (item as any).totalPrice - (item as any).totalDiscountPrice;
+    }
+
+    cart.totalItems = totalItems;
+    cart.totalQuantity = totalQuantity;
+    cart.subtotal = subtotal;
+    cart.totalDiscount = totalDiscount;
+    cart.totalPrice = subtotal - totalDiscount;
+
+    await cart.save();
+  }
+
+  // Cleanup expired cart items
+  async cleanupExpiredItems(): Promise<void> {
+    const now = new Date();
+
+    const result = await this.cartModel.updateMany(
+      { 'items.reservationExpires': { $lt: now }, isActive: true },
+      { $pull: { items: { reservationExpires: { $lt: now } } } },
+    );
+
+    if (result.modifiedCount > 0) {
+      this.logger.log(`Cleaned up ${result.modifiedCount} carts with expired items`);
+    }
+  }
+}
